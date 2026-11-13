@@ -1,24 +1,19 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { api, APP_VERSION, hostOf, logLine, platform } from "../api";
-import type { UpdateInfo } from "../types";
-import { APP_NAME } from "../branding";
+import { api, APP_VERSION, hostOf, logLine, platform, type UpdateInfo } from "../api";
 import { useStore } from "../store";
 import { Modal, Toggle } from "../components/ui";
-import GateDialog from "../components/GateDialog";
-import { copyPlaybackLog, initPlaybackLog, setPlaybackLog, tracePlayback, usePlaybackLog } from "../player/diagnostics";
+import { copyPlaybackLog, initPlaybackLog, setPlaybackLog, tracePlayback, usePlaybackLog } from "../playbackDiagnostics";
 import { formatNetDiag, shortVerdict } from "../netDiagReport";
 import { copyText } from "../clipboard";
-import { IBack, IBoltF, IBroom, IChevR, IHeart, IInfo, ILink, ILockF, IMoon, IRefresh, ISettings, ISun, IVolMute, IList, Logo } from "../icons";
+import { IBack, IBoltF, IBroom, IChevR, IHeart, IInfo, ILink, ILockF, IMoon, IRefresh, ISettings, ISun, IVolMute } from "../icons";
 
-/* 独立设置页：接入地址 / 外观 / 播放 / 本地数据 / 清理缓存 / 网络诊断 / 关于
+/* 独立设置页：线路 / 外观 / 播放 / 本地数据 / 清理缓存 / 网络诊断 / 关于
    入口：Windows 侧栏「设置」、Android「我的」右上角齿轮 */
 export default function Settings({ onBack, wide }: { onBack: () => void; wide: boolean }) {
-  const { theme, setTheme, favs, history, muteOnStartup, setMuteOnStartup, swipeEp, setSwipeEp, preferHevc, setPreferHevc, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity, toast, gate } = useStore();
+  const { theme, setTheme, favs, history, muteOnStartup, setMuteOnStartup, preferHevc, setPreferHevc, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity, toast } = useStore();
   const [about, setAbout] = useState(false);
   const [clearOpen, setClearOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
-  const [lineOpen, setLineOpen] = useState(false);
-  const [lineBase, setLineBase] = useState("");
   const [checking, setChecking] = useState(false);
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   /** 应用内更新进行到哪一步（空串=没在更新） */
@@ -29,7 +24,6 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
   const [diagReport, setDiagReport] = useState<string | null>(null);
   const [copyingReport, setCopyingReport] = useState(false);
 
-  useEffect(() => { setLineBase(gate.base); }, [gate.base]);
   useEffect(() => { void initPlaybackLog(); }, []);
 
   const checkUpdate = async () => {
@@ -111,14 +105,6 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               <Toggle on={muteOnStartup} onChange={setMuteOnStartup} label="启动时静音" />
             </div>
             <div className="flex items-center gap-3 px-3.5 py-3">
-              <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IList size={16} /></span>
-              <div className="flex-1 min-w-0">
-                <div className="text-[12.5px] text-on">上下划切集</div>
-                <div className="text-[10.5px] text-mut">多集短剧上下滑换集，划到头再换下一部</div>
-              </div>
-              <Toggle on={swipeEp} onChange={setSwipeEp} label="上下划切集" />
-            </div>
-            <div className="flex items-center gap-3 px-3.5 py-3">
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IBoltF size={16} /></span>
               <div className="flex-1 min-w-0">
                 <div className="text-[12.5px] text-on">优先高清</div>
@@ -147,14 +133,14 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
           </Section>
 
           <Section title="网络">
-            <button onClick={() => setLineOpen(true)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left pressable">
+            <div className="flex items-center gap-3 px-3.5 py-3">
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IBoltF size={16} /></span>
               <div className="flex-1 min-w-0">
-                <div className="text-[12.5px] text-on">接入地址</div>
-                <div className="text-[10.5px] text-mut truncate">{lineBase ? hostOf(lineBase) : "未设置"}</div>
+                <div className="text-[12.5px] text-on">播放源</div>
+                <div className="text-[10.5px] text-mut truncate">固定 huangguoai.com</div>
               </div>
-              <IChevR size={15} className="text-mut" />
-            </button>
+              <span className="text-[10.5px] text-mint">已固定</span>
+            </div>
             <div className="flex items-center gap-3 px-3.5 py-3">
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><ILockF size={15} /></span>
               <div className="flex-1 min-w-0">
@@ -254,18 +240,16 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
             <button onClick={() => setAbout(true)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left pressable">
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IInfo size={16} /></span>
               <div className="flex-1">
-                <div className="text-[12.5px] text-on">关于 {APP_NAME}</div>
+                <div className="text-[12.5px] text-on">关于 HGhubX</div>
                 <div className="text-[10.5px] text-mut">版本 {APP_VERSION} · 仅限非商业使用</div>
               </div>
               <IChevR size={15} className="text-mut" />
             </button>
           </Section>
 
-          <div className="text-center text-[10px] text-dim mt-5">{APP_NAME} {APP_VERSION} · {platform === "android" ? "Android" : platform === "ios" ? "iOS" : platform === "macos" ? "macOS" : platform === "linux" ? "Linux" : "Windows"} 客户端</div>
+          <div className="text-center text-[10px] text-dim mt-5">HGhubX {APP_VERSION} · {platform === "android" ? "Android" : platform === "ios" ? "iOS" : platform === "macos" ? "macOS" : platform === "linux" ? "Linux" : "Windows"} 客户端</div>
         </div>
       </div>
-
-      <GateDialog open={lineOpen} onClose={() => setLineOpen(false)} />
 
       <Modal open={diagReport !== null} onClose={() => setDiagReport(null)} width={520}>
         <div className="p-5">
@@ -289,15 +273,15 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
       <Modal open={about} onClose={() => setAbout(false)} width={392}>
         <div className="p-5">
           <div className="flex items-center gap-3">
-            <Logo size={44} />
+            <span className="w-11 h-11 rounded-(--r-sm) brand-grad glow-neon flex items-center justify-center text-on-primary text-[17px] font-black">H</span>
             <div>
-              <div className="text-[16px] font-bold text-on leading-tight">{APP_NAME}</div>
-              <div className="text-[11px] text-mut mt-0.5">{APP_NAME} · 第三方客户端 v{APP_VERSION}</div>
+              <div className="text-[16px] font-bold text-on leading-tight">HGhubX</div>
+              <div className="text-[11px] text-mut mt-0.5">HGhubX 客户端 v{APP_VERSION}</div>
             </div>
           </div>
 
           <p className="text-[12px] text-on/70 leading-relaxed mt-4">
-            基于 Rust + Tauri 2 构建的跨平台客户端，支持 Windows、macOS 与 Android。
+            基于 Rust + Tauri 2 构建的跨平台客户端，支持 Windows、macOS、Linux、Android 与 iOS。
             界面遵循 Fluent 设计语言，播放器采用沉浸式竖屏信息流。
           </p>
 
@@ -313,13 +297,10 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               <span className="text-[12px] text-on/85">github.com/zxsos/HGhubX</span>
               <span className="ml-auto text-[10.5px] text-primary">复制</span>
             </button>
-            <button onClick={() => {
-              if (!lineBase) { toast("尚未配置接入地址", "info"); return; }
-              copyText(lineBase).then(() => toast("接入地址已复制", "ok")).catch(() => {});
-            }}
+            <button onClick={() => { copyText("https://huangguoai.com").then(() => toast("站点地址已复制", "ok")).catch(() => {}); }}
               className="w-full flex items-center gap-2 py-2.5 text-left pressable">
               <ILink size={15} className="text-mut" />
-              <span className="text-[12px] text-on/85">{lineBase ? hostOf(lineBase) : "未配置接入地址"}</span>
+              <span className="text-[12px] text-on/85">huangguoai.com</span>
               <span className="ml-auto text-[10.5px] text-primary">复制</span>
             </button>
             <div className="flex items-center gap-2 py-2.5">

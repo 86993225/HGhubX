@@ -197,6 +197,7 @@ pub fn run() {
             api::api_logout,
             api::api_me,
             api::api_feed,
+            api::api_original_videos,
             api::api_topics,
             api::api_topic,
             api::api_tags,

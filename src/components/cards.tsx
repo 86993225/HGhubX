@@ -22,7 +22,7 @@ export function WaterfallCard({ v, onOpen }: { v: VideoCard; onOpen: () => void 
       <div className="absolute inset-x-0 bottom-0 p-2">
         <div className="text-[11.5px] font-medium text-white leading-snug clamp-2 tsh">{v.title}</div>
         <div className="flex items-center justify-between mt-1">
-          <span className="text-[9.5px] text-white/65 truncate max-w-[60%]">{v.author?.name || "佚名"}</span>
+          <span className="text-[9.5px] text-white/65 truncate max-w-[60%]">{v.author?.name || "HGhubX"}</span>
           <span className="flex items-center gap-0.5 text-[9.5px] text-white/75"><IHeartF size={10} className="text-white/70" />{fmt(v.like_count)}</span>
         </div>
       </div>
@@ -59,6 +59,9 @@ export function RowCard({ v, onOpen }: { v: VideoCard; onOpen: () => void }) {
         <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-md text-[8.5px] font-bold brand-grad">
           {v.is_finished ? "完结" : `${v.episode_count}集`}
         </span>
+        {!!v.score && (
+          <span className="absolute bottom-1.5 left-1.5 text-[9px] font-bold text-amber tsh">{v.score.toFixed(1)} 分</span>
+        )}
         <span className="absolute bottom-1.5 right-1.5 flex items-center gap-0.5 text-[9px] font-semibold text-white/90 tsh"><IPlayF size={9} />{fmt(v.hot)}</span>
       </div>
       <div className="mt-1.5 text-[11.5px] font-medium text-on clamp-1 leading-tight">{v.title}</div>

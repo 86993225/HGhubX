@@ -54,6 +54,101 @@ pub async fn net_diag() -> Result<Value, String> {
     Ok(crate::net::diagnose().await)
 }
 
+/* ───────────────────────── 线路（数据源） ───────────────────────── */
+
+/// 当前线路 + 固定线路清单（镜像线路另外按需拉取）。
+#[tauri::command]
+pub async fn line_state() -> Result<Value, String> {
+    Ok(json!({
+        "base": base(),
+        "default": crate::net::DEFAULT_BASE,
+        "fixed": crate::lines::fixed(),
+    }))
+}
+
+/// 手动切换线路：唯一播放源固定为 huangguoai.com，只放行默认主站，其余拒绝。
+#[tauri::command]
+pub async fn line_set(state: State<'_, Api>, url: String) -> Result<String, String> {
+    let next = crate::net::normalize_base(&url)
+        .ok_or_else(|| "线路地址无效（需要纯 HTTPS 站点地址，禁止内网）".to_string())?;
+    if next != crate::net::DEFAULT_BASE {
+        return Err("唯一播放源已固定，不再支持切换线路".into());
+    }
+    let previous = base();
+    let applied = crate::net::set_base(&next)?;
+    if previous != applied {
+        state.session.clear();
+    }
+    Ok(applied)
+}
+
+/// 从地址发布页抓镜像线路（只在用户点开「线路」时调用）。
+#[tauri::command]
+pub async fn line_mirrors() -> Result<Value, String> {
+    // 用户手动点「刷新 / 打开线路」时重新读一次系统代理：代理软件开关过之后旧客户端会卡死
+    crate::net::refresh_client();
+    crate::lines::mirrors().await
+}
+
+/// 可达性探测：只报结果，不做自动检查 / 自动切换。
+#[tauri::command]
+pub async fn line_probe(urls: Vec<String>) -> Result<Value, String> {
+    crate::net::refresh_client();
+    Ok(crate::lines::probe(urls).await)
+}
+
+/// 自动选线：`.com` 与 `.ai` 各探一次，选通的那条、快的那条。
+///
+/// 和 [`line_set`] 的区别是**不清会话**：两个域名是同一个站点，登录态本来就通用；
+/// 自动切换如果清会话，用户每换一次网络就被踢下线，那是不能接受的。
+#[tauri::command]
+pub async fn line_auto() -> Result<Value, String> {
+    crate::net::refresh_client();
+    let pick = crate::lines::auto_pick().await;
+    let chosen = pick
+        .get("base")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let previous = base();
+    let mut switched = false;
+    if !chosen.is_empty() && chosen != previous {
+        let next = crate::net::set_base(&chosen)?;
+        switched = next != previous;
+    }
+    Ok(json!({
+        "previous": previous,
+        "base": crate::net::base(),
+        "switched": switched,
+        "pick": pick,
+    }))
+}
+
+/// 当前走的是镜像时，敲一次主站：通了就切回（不清会话）。
+///
+/// 和 [`line_auto`] 的分工：[`line_auto`] 是「整体比一次」，要抓发布页；
+/// 这个只问一句「主站现在通不通」，代价一个请求，可以频繁调用。
+#[tauri::command]
+pub async fn line_try_main() -> Result<Value, String> {
+    crate::net::refresh_client();
+    let probe = crate::lines::try_main().await;
+    let previous = base();
+    let mut switched = false;
+    if probe.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let chosen = probe.get("base").and_then(Value::as_str).unwrap_or_default();
+        if !chosen.is_empty() && chosen != previous {
+            let next = crate::net::set_base(chosen)?;
+            switched = next != previous;
+        }
+    }
+    Ok(json!({
+        "previous": previous,
+        "base": crate::net::base(),
+        "switched": switched,
+        "probe": probe,
+    }))
+}
+
 /* ───────────────────────── 更新检查 ───────────────────────── */
 
 const REPO: &str = "zxsos/HGhubX";
@@ -80,6 +175,9 @@ fn is_newer(latest: &str, current: &str) -> bool {
 }
 
 /// 从 tag / name 里取出 `x.y.z`。
+///
+/// 我们的 tag 是 `hgfix-1.2.1-r5`，上游是 `v1.2.0`，release name 是 `HGhubX 1.2.1+hg.1`。
+/// 直接拿去比会从第一位就判负（`hgfix-1` 解析成 0），所以先抠出版本号。
 fn version_in(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
@@ -105,6 +203,11 @@ fn version_in(text: &str) -> String {
     String::new()
 }
 
+/// 线路体检：探一次 `/api/videos`，和自动选线用同一个判据。
+#[tauri::command]
+pub async fn line_health() -> Result<Value, String> {
+    Ok(crate::lines::health().await)
+}
 /// 对比 GitHub Release 的 tag 与当前版本（未认证 60 次/小时/IP，够用）。
 #[tauri::command]
 pub async fn check_update() -> Result<Value, String> {
@@ -361,7 +464,6 @@ pub async fn app_boot(state: State<'_, Api>) -> Result<Value, String> {
         "user": state.session.user(&origin),
         "logged_in": state.session.token(&origin).is_some(),
         "base": origin,
-        "gate": crate::infra::source::gate_state(),
         "strict_security": crate::network_policy::strict_security(),
         "cli_relaxed": crate::network_policy::cli_strict_override() == Some(false),
     }))
@@ -483,6 +585,29 @@ pub async fn api_feed(state: State<'_, Api>, page: u32, size: u32) -> Result<Val
         .await
 }
 
+/// 原创频道，返回分页视频卡（结构同 api_feed）。
+/// `cate="all"` 走 `/api/videos?is_original=1`；`ai-duanju`/`ai-manju` 走
+/// `/api/videos/category/{cate}?is_original=1`。
+#[tauri::command]
+pub async fn api_original_videos(
+    state: State<'_, Api>,
+    cate: String,
+    page: u32,
+    size: u32,
+    sort: Option<String>,
+) -> Result<Value, String> {
+    let sort = match sort.as_deref() {
+        Some(s) if !s.trim().is_empty() => format!("&sort={s}"),
+        _ => String::new(),
+    };
+    let path = if cate == "all" {
+        format!("/api/videos?is_original=1&page={page}&size={size}{sort}")
+    } else {
+        format!("/api/videos/category/{cate}?is_original=1&page={page}&size={size}{sort}")
+    };
+    state.get(&path).await
+}
+
 /* ───────────────────────── 专题 / 标签 ───────────────────────── */
 
 /// 专题列表：`/api/topics` 返回 data.items（标题/封面/简介/收录数）。
@@ -524,10 +649,15 @@ pub async fn api_category(
     cate: String,
     page: u32,
     size: u32,
+    sort: Option<String>,
 ) -> Result<Value, String> {
+    let sort = match sort.as_deref() {
+        Some(s) if !s.trim().is_empty() => format!("&sort={s}"),
+        _ => String::new(),
+    };
     state
         .get(&format!(
-            "/api/videos/category/{cate}?page={page}&size={size}"
+            "/api/videos/category/{cate}?page={page}&size={size}{sort}"
         ))
         .await
 }
@@ -571,9 +701,18 @@ pub async fn api_search_hot(state: State<'_, Api>) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn api_posts(state: State<'_, Api>, page: u32, size: u32) -> Result<Value, String> {
+pub async fn api_posts(
+    state: State<'_, Api>,
+    page: u32,
+    size: u32,
+    sort: Option<String>,
+) -> Result<Value, String> {
+    let sort = match sort.as_deref() {
+        Some(s) if !s.trim().is_empty() => format!("&sort={s}"),
+        _ => String::new(),
+    };
     state
-        .get(&format!("/api/posts?page={page}&size={size}"))
+        .get(&format!("/api/posts?page={page}&size={size}{sort}"))
         .await
 }
 
@@ -768,17 +907,24 @@ pub async fn api_post_categories(state: State<'_, Api>) -> Result<Value, String>
     state.get("/api/site/categories/post").await
 }
 
-/// 按分类取吃瓜帖：`/api/posts/category/{route}`。
+/// 按分类取吃瓜帖：`/api/posts/category/{route}`；`sort=latest` 走最新排序。
 #[tauri::command]
 pub async fn api_post_category(
     state: State<'_, Api>,
     route: String,
     page: u32,
     size: u32,
+    sort: Option<String>,
 ) -> Result<Value, String> {
     let encoded: String = url::form_urlencoded::byte_serialize(route.as_bytes()).collect();
+    let sort = match sort.as_deref() {
+        Some(s) if !s.trim().is_empty() => format!("&sort={s}"),
+        _ => String::new(),
+    };
     state
-        .get(&format!("/api/posts/category/{encoded}?page={page}&size={size}"))
+        .get(&format!(
+            "/api/posts/category/{encoded}?page={page}&size={size}{sort}"
+        ))
         .await
 }
 

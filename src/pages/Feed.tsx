@@ -1,19 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { api, cover, fmt, fmtTime, isMobile, logLine, mediaUrl } from "../api";
 import type { Detail, Episode, Post, VideoCard } from "../types";
 import { useStore } from "../store";
-import { Avatar, Img, Sheet } from "../components/ui";
-import VideoSurface, { type VideoHandle } from "../player/VideoSurface";
-import PlayerControls from "../player/PlayerControls";
-import PlaybackLock from "../player/PlaybackLock";
-import { ArticlePanel, CommentsPanel, EpisodesPanel } from "../components/Panels";
-import { RowCard } from "../components/cards";
+import { Avatar, Img, Sheet } from "./ui";
+import VideoSurface, { type VideoHandle } from "./VideoSurface";
+import PlayerControls from "./PlayerControls";
+import PlaybackLock from "./PlaybackLock";
+import { ArticlePanel, CommentsPanel, EpisodesPanel } from "./Panels";
+import { RowCard } from "./cards";
 import { setBackHandler } from "../back";
 import { copyText } from "../clipboard";
-import { tracePlayback } from "../player/diagnostics";
-import {
-  episodeKey, nextEpisodeNumber, previousEpisodeNumber, resumePosition, selectPlaybackUrl, toPlaybackSource, type PlaybackSource,
-} from "../player/session";
+import { tracePlayback } from "../playbackDiagnostics";
 import {
   IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IExpand, IFileText, IHeart, IHeartF,
   ILink, IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVertSwap, IVol, IVolMute,
@@ -48,7 +46,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [index, setIndex] = useState(startIndex);
   const [epMap, setEpMap] = useState<Record<number, number>>(() => (startEp ? { [videoIds[startIndex]]: startEp } : {}));
   const [details, setDetails] = useState<Record<number, Detail>>({});
-  const [sources, setSources] = useState<Record<string, PlaybackSource>>({});
+  const [playUrls, setPlayUrls] = useState<Record<string, string>>({});
+  const [hevcUrls, setHevcUrls] = useState<Record<string, string>>({});
   const [cards, setCards] = useState<Record<number, VideoCard>>({});
   const [posts, setPosts] = useState<Record<number, Post>>({});
   const [related, setRelated] = useState<VideoCard[]>([]);
@@ -66,7 +65,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [descOpen, setDescOpen] = useState(false);
   /* 续播：拿到时长后再 seek 一次（只对进入时那一条生效） */
   const resumeRef = useRef<{ key: string; t: number } | null>(
-    startTime && startTime > 1 ? { key: episodeKey(videoIds[startIndex], startEp || 1), t: startTime } : null,
+    startTime && startTime > 1 ? { key: `${videoIds[startIndex]}:${startEp || 1}`, t: startTime } : null,
   );
   /* 观看进度：onTime 里节流写回 store，卸载时再兜一次 */
   const liveRef = useRef({ id: 0, ep: 1, dur: 0, t: 0 });
@@ -130,10 +129,10 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const curId = videoIds[index];
   const detail = details[curId];
   const curEp = epMap[curId] || 1;
-  const playKey = episodeKey(curId, curEp);
-  const source = sources[playKey];
-  const hevcUrl = source?.hevcUrl || "";
-  const playUrl = selectPlaybackUrl(source, preferHevc);
+  const playKey = `${curId}:${curEp}`;
+  const mainUrl = playUrls[playKey] || "";
+  const hevcUrl = hevcUrls[playKey] || "";
+  const playUrl = preferHevc && hevcUrl ? hevcUrl : mainUrl;
   useEffect(() => { setZoom({ s: 1, x: 0, y: 0, g: false }); pinchRef.current = null; pointersRef.current.clear(); }, [playUrl]);
   useEffect(() => { videoRef.current?.trace("page.active", { active, view: mode, video_id: curId, episode: curEp }); }, [active, mode, curId, curEp]);
   const episodes = detail?.episodes || [];
@@ -155,11 +154,10 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     setDuration(d);
     liveRef.current = { ...liveRef.current, dur: d };
     const r = resumeRef.current;
-    const target = resumePosition(r?.t, d);
-    if (r && r.key === playKey && target != null) {
+    if (r && r.key === playKey && r.t > 1 && (!d || r.t < d - 3)) {
       resumeRef.current = null;
-      videoRef.current?.seek(target, "history_resume");
-      setTime(target);
+      videoRef.current?.seek(r.t, "history_resume");
+      setTime(r.t);
     }
   };
 
@@ -169,7 +167,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
         title: post?.title || "",
         cover: post?.cover || "",
         desc: post?.content || post?.desc || "",
-        author: "匿名用户",
+        author: "吃瓜",
         authorId: -1,
         tags: post?.tags || [],
         score: 0,
@@ -182,7 +180,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
         title: detail?.title || cards[curId]?.title || "",
         cover: detail?.cover || cards[curId]?.cover || "",
         desc: detail?.description || "",
-        author: detail?.author?.name || "佚名",
+        author: detail?.author?.name || "HGhubX",
         authorId: detail?.author?.id || -1,
         tags: detail?.tags || [],
         score: detail?.score || 0,
@@ -196,12 +194,9 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const hasVideo = kind === "video" || !!post?.video_url;
   const articleHtml = kind === "post" && !hasVideo ? (post?.content || "") : "";
 
-  /* 分享：复制播放链接（站点地址从当前接入配置读取，不写死域名） */
-  const shareLink = async () => {
-    const base = await api.gateState().then((s) => s.base).catch(() => "");
-    const u = kind === "post"
-      ? (posts[curId]?.video_url || meta.title)
-      : base ? `${base.replace(/\/+$/, "")}/video/${curId}/` : meta.title;
+  /* 分享：复制播放链接 */
+  const shareLink = () => {
+    const u = kind === "post" ? (posts[curId]?.video_url || meta.title) : `https://huangguoai.com/video/${curId}/`;
     copyText(u).then(() => toast("链接已复制", "ok")).catch(() => toast("复制失败", "info"));
   };
 
@@ -263,21 +258,22 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const stepDir = useCallback((dir: number) => {
     if (swipeEp && kind === "video") {
       const ep = epMap[curId] || 1;
-      const want = dir === 1 ? nextEpisodeNumber(episodes, ep) : previousEpisodeNumber(episodes, ep);
-      if (want != null) {
+      const total = episodes.length;
+      const want = dir === 1 ? (total === 0 || ep < total ? ep + 1 : 0) : (ep > 1 ? ep - 1 : 0);
+      if (want) {
         setEpMap((m) => ({ ...m, [curId]: want }));
         setPanel(null);
         return;
       }
     }
     go(dir);
-  }, [swipeEp, kind, epMap, curId, episodes, go]);
+  }, [swipeEp, kind, epMap, curId, episodes.length, go]);
 
   const canStep = (dir: number) => {
     if (swipeEp && kind === "video") {
       const ep = epMap[curId] || 1;
-      const exists = dir === 1 ? nextEpisodeNumber(episodes, ep) != null : previousEpisodeNumber(episodes, ep) != null;
-      if (exists) return true;
+      const total = episodes.length;
+      if (dir === 1 ? (total === 0 || ep < total) : ep > 1) return true;
     }
     const next = index + dir;
     return next >= 0 && next < videoIds.length;
@@ -331,13 +327,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   /* 拉播放地址 */
   useEffect(() => {
     if (!curId) return;
-    if (sources[playKey]) return;
+    if (playUrls[playKey]) return;
     let alive = true;
     api.play(curId, curEp)
       .then((info) => {
         if (!alive) return;
-        const nextSource = toPlaybackSource(info);
-        const streamUrl = nextSource?.mainUrl || "";
+        const streamUrl = info?.streams?.main || info?.video_url;
+        const hevcStream = info?.streams?.hevc || info?.video_url_hevc || "";
         // 接口本身成功但业务失败（status=0 / streams 为空）时不会进 call() 的 catch，
         // 这里把原始 status/msg 落进 debug.log ——「暂无播放地址」的唯一现场证据。
         // src 才是真正喂给播放器的值；video_url 是新接口不再返回的旧字段，别拿它判断成败。
@@ -355,8 +351,9 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
           video_id: curId, episode: curEp, resolved: !!streamUrl, kind, host,
           status: raw.status ?? null, msg: String(raw.msg ?? "") || null,
         });
-        if (!nextSource) throw new Error("暂无播放地址");
-        setSources((m) => ({ ...m, [playKey]: nextSource }));
+        if (!streamUrl) throw new Error("暂无播放地址");
+        setPlayUrls((m) => ({ ...m, [playKey]: streamUrl }));
+        if (hevcStream) setHevcUrls((m) => ({ ...m, [playKey]: hevcStream }));
         addHistory(curId, curEp);
       })
       .catch((e) => { if (alive) setErr((e as Error).message || "取播放地址失败"); });
@@ -368,18 +365,19 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   useEffect(() => {
     if (!curId || kind !== "video") return;
     const ep = epMap[curId] || 1;
+    const total = episodes.length;
     const want: number[] = [];
-    const prev = previousEpisodeNumber(episodes, ep);
-    const next = nextEpisodeNumber(episodes, ep);
-    if (prev != null) want.push(prev);
-    if (next != null) want.push(next);
+    if (ep > 1) want.push(ep - 1);
+    if (total === 0 || ep < total) want.push(ep + 1);
     for (const e of want) {
-      const k = episodeKey(curId, e);
-      if (sources[k]) continue;
+      const k = `${curId}:${e}`;
+      if (playUrls[k]) continue;
       api.play(curId, e)
         .then((info) => {
-          const nextSource = toPlaybackSource(info);
-          if (nextSource) setSources((m) => ({ ...m, [k]: nextSource }));
+          const u = info?.streams?.main || info?.video_url;
+          const h = info?.streams?.hevc || info?.video_url_hevc || "";
+          if (u) setPlayUrls((m) => ({ ...m, [k]: u }));
+          if (h) setHevcUrls((m) => ({ ...m, [k]: h }));
         })
         .catch(() => { /* 预热失败不影响当前播放 */ });
     }
@@ -595,8 +593,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
         const dir = dy < 0 ? 1 : -1;
         const ep = epMap[curId] || 1;
         const total = episodes.length;
-        const want = dir === 1 ? nextEpisodeNumber(episodes, ep) : previousEpisodeNumber(episodes, ep);
-        if (swipeEp && kind === "video" && want != null) {
+        const want = dir === 1 ? (total === 0 || ep < total ? ep + 1 : 0) : (ep > 1 ? ep - 1 : 0);
+        if (swipeEp && kind === "video" && want) {
           setEpMap((m) => ({ ...m, [curId]: want }));
           toast(`第 ${want}集${total ? ` / ${total}` : ""}`, "info");
           try { navigator.vibrate?.(12); } catch { /* ignore */ }
@@ -652,7 +650,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     wake();
     keepAlive();
     if (!isDesktop) {
-      try { void api.setOrientation(landscape); } catch { /* ignore */ }
+      try { void invoke("set_orientation", { landscape }); } catch { /* ignore */ }
       if (landscape) {
         try {
           (screen.orientation as unknown as { lock?: (o: string) => Promise<void> })?.lock?.("landscape")?.catch(() => {});
@@ -666,7 +664,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     setFs(false);
     keepAlive();
     if (!isDesktop) {
-      try { void api.setOrientation(false); } catch { /* ignore */ }
+      try { void invoke("set_orientation", { landscape: false }); } catch { /* ignore */ }
       try { screen.orientation?.unlock?.(); } catch { /* ignore */ }
     }
   }, [isDesktop, keepAlive, setClean, setFs]);
@@ -674,7 +672,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   /* 若用户在视频首帧宽高解析出来前已点进全屏，解析出横屏后自动补发横屏方向请求 */
   useEffect(() => {
     if (isDesktop || !fs || !landscapeVideo) return;
-    try { void api.setOrientation(true); } catch { /* ignore */ }
+    try { void invoke("set_orientation", { landscape: true }); } catch { /* ignore */ }
     try {
       (screen.orientation as unknown as { lock?: (o: string) => Promise<void> })?.lock?.("landscape")?.catch(() => {});
     } catch { /* ignore */ }
@@ -837,8 +835,6 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     return <div className="absolute inset-0 bg-black flex items-center justify-center"><div className="w-9 h-9 spinner" /></div>;
   }
 
-  const nextEp = episodes.length ? nextEpisodeNumber(episodes, curEp) : null;
-
   return (
     <div
       className={`hg-player-ui ${rotated ? "fs-landscape" : (!isDesktop && fs ? "fs-immersive" : "absolute inset-0")} overflow-hidden bg-black player-root ${controlsLocked ? "is-locked" : ""} ${isDesktop ? "player-surface" : ""} ${theater ? "is-theater" : ""} ${isDesktop && idle ? "is-idle" : ""}`}
@@ -872,7 +868,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   onPlaying={() => { setPaused(false); setWaiting(false); }}
                   onPause={() => setPaused(true)}
                   onWaiting={() => setWaiting(true)}
-                  onEnded={() => { if (nextEp != null) pickEp(nextEp); }}
+                  onEnded={() => { const next = episodes.find((e) => e.ep_num === curEp + 1); if (next) pickEp(next.ep_num); }}
                   onError={(m) => {
                     setErr(m);
                     if (preferHevc && hevcUrl) {
@@ -1178,8 +1174,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
           visible={active && !idle}
           seekEnabled={active && !controlsLocked}
           seekKey={playKey}
-          nextDisabled={nextEp == null && index >= videoIds.length - 1}
-          nextTitle={nextEp != null ? "下一集 E" : "下一部 ↓"}
+          nextDisabled={!episodes.some((e) => e.ep_num === curEp + 1) && index >= videoIds.length - 1}
+          nextTitle={episodes.some((e) => e.ep_num === curEp + 1) ? "下一集 E" : "下一部 ↓"}
           swipeEp={swipeEp}
           onToggleSwipe={() => { setSwipeEp(!swipeEp); toast(swipeEp ? "上下划切集已关闭" : "上下划切集已开启"); }}
           onToggle={() => videoRef.current?.toggle()}
@@ -1193,7 +1189,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
           onTheater={() => setTheater((v) => !v)}
           onFullscreen={toggleFull}
           onNext={() => {
-            if (nextEp != null) pickEp(nextEp);
+            const nx = episodes.find((e) => e.ep_num === curEp + 1);
+            if (nx) pickEp(nx.ep_num);
             else go(1);
           }}
         />
@@ -1272,10 +1269,10 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
               className={`ml-auto shrink-0 flex items-center gap-1 px-2.5 h-8 rounded-full text-[12px] font-bold pressable ${effRate !== 1 ? "bg-primary text-on-primary" : "hg-chip hg-ink-2"}`}>
               <IBoltF size={12} />{effRate}x
             </button>
-            {nextEp != null && (
-              <button onClick={() => pickEp(nextEp)}
+            {curEp < episodes.length && (
+              <button onClick={() => pickEp(curEp + 1)}
                 className="shrink-0 flex items-center gap-1 px-2.5 h-8 rounded-full text-[12px] font-semibold hg-chip hg-ink-2 pressable"
-                aria-label={`下一集 第${nextEp}集`}>
+                aria-label={`下一集 第${curEp + 1}集`}>
                 <IVertSwap size={12} />下集
               </button>
             )}

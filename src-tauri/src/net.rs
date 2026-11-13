@@ -16,8 +16,10 @@
 //! * Android 没有注册表可读，系统「Wi-Fi 代理」同样不被 reqwest 采用；
 //!   安卓上只有 VPN/TUN 模式（VpnService 抓全流量）才有效。
 //!
-//! 排查手段：环境变量 `HGHUBX_PROXY=http://127.0.0.1:7897` 可强制指定代理，
-//! `net_diag` 命令会输出 DNS/HTTP/环境变量快照。
+//! 排查手段：环境变量 `HGHUB_PROXY=http://127.0.0.1:7897` 可强制指定代理，
+//! 进程里的 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 由 reqwest `system-proxy` 读取；
+//! Linux 桌面还会读 GNOME 的 `gsettings` 手动代理（http/socks），无需用户手动设置。
+//! `net_diag` 命令会输出 DNS/HTTP/环境变量与探测到的代理（脱敏）快照。
 
 use crate::network_policy;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -26,28 +28,233 @@ use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-/// 默认上游：门牌化后没有内置源，必须由用户输入地址激活。
-pub const DEFAULT_BASE: &str = "";
+/// 默认上游（固定线路 1）。
+pub const DEFAULT_BASE: &str = "https://huangguoai.com";
 
-/// 当前门牌基址（不带结尾斜杠）。唯一来源是 [`crate::infra::source`]。
+/// 当前上游基址（不带结尾斜杠）。可在设置里切到固定线路 2 或镜像线路，运行时立即生效。
+static BASE: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(DEFAULT_BASE.to_string()));
+/// 线路配置落盘位置（应用数据目录/line.json），由 [`bind_base`] 在启动时绑定。
+static BASE_FILE: Lazy<RwLock<Option<PathBuf>>> = Lazy::new(|| RwLock::new(None));
+
+/// 当前上游基址。
 pub fn base() -> String {
-    crate::infra::source::base()
+    BASE.read()
+        .map(|b| b.clone())
+        .unwrap_or_else(|_| DEFAULT_BASE.to_string())
+}
+
+/// 线路必须是纯 HTTPS origin，不允许路径、认证、查询串或片段。
+pub fn normalize_base(raw: &str) -> Option<String> {
+    let parsed = network_policy::parse_target(raw.trim()).ok()?;
+    if parsed.scheme() != "https"
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    Some(parsed.origin().ascii_serialization())
+}
+
+/// 哪些 origin 允许携带凭据：两个固定入口，加上发布页推荐过、且当前可能作为线路的镜像。
+///
+/// 国内网络连不上 `.com`，只能用镜像；镜像和主站是同一后端、同一个账号体系。
+/// 只认发布页真的给过的地址（见 [`crate::lines::is_trusted_mirror`]），
+/// 用户手填的任意域名依旧会被严格模式拦下。
+pub fn trusted_auth_origin(origin: &str) -> bool {
+    matches!(origin, "https://huangguoai.com" | "https://huangguoai.ai")
+        || crate::lines::is_trusted_mirror(origin)
+}
+
+/// 启动时绑定线路：唯一播放源固定为 huangguoai.com，不再恢复旧 line.json
+/// （升级前用户可能停在镜像），直接清掉旧配置，base 恒为 DEFAULT_BASE。
+pub fn bind_base(dir: &std::path::Path) {
+    network_policy::bind_security(dir);
+    let path = dir.join("line.json");
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+    if let Ok(mut f) = BASE_FILE.write() {
+        *f = Some(path);
+    }
+}
+
+/// 切换线路并落盘，返回规整后的地址。
+pub fn set_base(url: &str) -> Result<String, String> {
+    let next = normalize_base(url)
+        .ok_or_else(|| "线路地址无效（需要纯 HTTPS 站点地址，禁止内网）".to_string())?;
+    let previous = base();
+    crate::lines::remember_line(&next);
+    if let Ok(mut cur) = BASE.write() {
+        *cur = next.clone();
+    }
+    if let Some(path) = BASE_FILE.read().ok().and_then(|p| p.clone()) {
+        let _ = std::fs::write(path, json!({ "base": next }).to_string());
+    }
+    if previous != next {
+        crate::playback_log::record(
+            "line.changed",
+            json!({
+                "previous_host": url::Url::parse(&previous).ok().and_then(|u| u.host_str().map(str::to_owned)),
+                "line_host": url::Url::parse(&next).ok().and_then(|u| u.host_str().map(str::to_owned)),
+            }),
+        );
+    }
+    Ok(next)
 }
 
 pub const UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-/// 手动指定代理（排查 / 公司内网用）：`HGHUBX_PROXY=http://127.0.0.1:7897`。
+/// 手动指定代理（排查 / 公司内网用）：`HGHUB_PROXY=http://127.0.0.1:7897`。
 /// 不设时交给 reqwest 的 `system-proxy` 探测（注册表 + 环境变量）。
 fn proxy_override() -> Option<String> {
-    std::env::var("HGHUBX_PROXY")
+    std::env::var("HGHUB_PROXY")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// 进程环境变量里有没有代理（reqwest 的 `system-proxy` 会自己读这些，不重复应用）。
+fn env_proxy_set() -> bool {
+    ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]
+        .iter()
+        .any(|key| std::env::var(key).ok().is_some_and(|v| !v.trim().is_empty()))
+}
+
+/// 应用层最终采用的显式代理（不含环境变量——那部分交给 reqwest）。
+/// 优先级：`HGHUB_PROXY` > 进程环境变量（reqwest 处理）> Linux GNOME gsettings。
+fn detected_proxy() -> Option<String> {
+    if let Some(p) = proxy_override() {
+        return Some(p);
+    }
+    if env_proxy_set() {
+        return None;
+    }
+    gnome_proxy()
+}
+
+#[cfg(target_os = "linux")]
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// 读 GNOME 系统代理配置（gsettings）。gsettings 不存在 / schema 缺失时返回 None。
+#[cfg(target_os = "linux")]
+fn gsettings_get(schema: &str, key: &str) -> Option<String> {
+    let out = std::process::Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(unquote(&String::from_utf8_lossy(&out.stdout)))
+}
+
+#[cfg(target_os = "linux")]
+fn format_proxy_url(scheme: &str, host: &str, port: &str) -> String {
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    format!("{scheme}://{host}:{port}")
+}
+
+/// Linux 桌面（GNOME）的固定手动代理：`mode=manual` 时取 http，为空再试 socks。
+/// PAC（mode=auto）不支持，返回 None。
+#[cfg(target_os = "linux")]
+fn gnome_proxy() -> Option<String> {
+    if gsettings_get("org.gnome.system.proxy", "mode").as_deref() != Some("manual") {
+        return None;
+    }
+    let http_host = gsettings_get("org.gnome.system.proxy.http", "host").unwrap_or_default();
+    let http_port = gsettings_get("org.gnome.system.proxy.http", "port").unwrap_or_default();
+    if !http_host.is_empty() && !http_port.is_empty() {
+        return Some(format_proxy_url("http", &http_host, &http_port));
+    }
+    let socks_host = gsettings_get("org.gnome.system.proxy.socks", "host").unwrap_or_default();
+    let socks_port = gsettings_get("org.gnome.system.proxy.socks", "port").unwrap_or_default();
+    if !socks_host.is_empty() && !socks_port.is_empty() {
+        return Some(format_proxy_url("socks5", &socks_host, &socks_port));
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gnome_proxy() -> Option<String> {
+    None
+}
+
+/// Windows 系统代理：读 `HKCU\...\Internet Settings`，`ProxyEnable=1` 且 `ProxyServer`
+/// 非空即视为已启用。reqwest 已开 `system-proxy` 会自动按注册表走，这里只返回 bool。
+#[cfg(target_os = "windows")]
+fn windows_proxy_enabled() -> bool {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+    else {
+        return false;
+    };
+    let enabled: u32 = match key.get_value("ProxyEnable") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if enabled != 1 {
+        return false;
+    }
+    key.get_value::<String, _>("ProxyServer")
+        .is_ok_and(|server| !server.trim().is_empty())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_proxy_enabled() -> bool {
+    false
+}
+
+/// macOS 系统代理：`scutil --proxy` 输出里 HTTP/HTTPS/SOCKS 任一项 Enable=1 即视为已启用。
+#[cfg(target_os = "macos")]
+fn macos_proxy_enabled() -> bool {
+    let Ok(out) = std::process::Command::new("scutil").arg("--proxy").output() else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    ["HTTPEnable", "HTTPSEnable", "SOCKSEnable"]
+        .iter()
+        .any(|key| {
+            text.lines().any(|line| {
+                let mut parts = line.splitn(2, ':');
+                parts.next().map(str::trim) == Some(*key)
+                    && parts.next().map(|value| value.trim() == "1").unwrap_or(false)
+            })
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_proxy_enabled() -> bool {
+    false
+}
+
+/// 操作系统级系统代理是否已启用（Windows 注册表 / macOS scutil / Linux GNOME），只报 bool。
+fn system_proxy_enabled() -> bool {
+    windows_proxy_enabled() || macos_proxy_enabled() || gnome_proxy().is_some()
 }
 
 /// 按**当前**系统代理设置新建一个客户端。
@@ -68,9 +275,9 @@ fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Str
     if !addrs.is_empty() {
         builder = builder.resolve_to_addrs(host, addrs);
     }
-    if let Some(p) = proxy_override() {
+    if let Some(p) = detected_proxy() {
         // 错误信息不能含原始代理 URL（其中可能有用户名/密码）。
-        let proxy = reqwest::Proxy::all(&p).map_err(|_| "HGHUBX_PROXY 配置无效（已隐藏原始值）")?;
+        let proxy = reqwest::Proxy::all(&p).map_err(|_| "代理配置无效（已隐藏原始值）")?;
         builder = builder.proxy(proxy);
     }
     builder
@@ -97,19 +304,32 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
     client_for_dns(raw, false).await
 }
 
+/// 是否处于「有代理」状态：显式代理（`HGHUB_PROXY`）、系统代理（Linux GNOME / Windows 注册表 / macOS scutil）或进程环境变量。
+/// 有代理时域名交给代理解析，本地不再做 DNS 固定与 IP 校验（被污染的 DNS 不影响代理链路）。
+fn proxy_active() -> bool {
+    detected_proxy().is_some()
+        || env_proxy_set()
+        || windows_proxy_enabled()
+        || macos_proxy_enabled()
+}
+
 async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<reqwest::Client>), String> {
     let strict = network_policy::strict_security();
     let target = network_policy::parse_target_with_mode(raw, strict)?;
     let host = target.host_str().ok_or("目标缺少主机名")?;
     let port = target.port_or_known_default().ok_or("目标端口无效")?;
-    let key = format!("{strict}:{host}:{port}:{public_dns}");
+    let proxy = proxy_active();
+    let key = format!("{strict}:{host}:{port}:{public_dns}:{proxy}");
     {
         let cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
         if let Some(http) = cached_client(&cache, &key, Instant::now()) {
             return Ok((target, http));
         }
     }
-    let (addrs, ttl) = if public_dns {
+    let (addrs, ttl) = if proxy {
+        // 有代理：跳过本地解析与 IP 校验，addrs 留空，域名交给代理。
+        (Vec::new(), CLIENT_TTL)
+    } else if public_dns {
         let resolver = build_client(crate::media_dns::HOST, &crate::media_dns::BOOTSTRAP)?;
         let resolution = crate::media_dns::resolve(&resolver, host, port).await?;
         network_policy::check_addresses_with_mode(&resolution.addresses, strict)?;
@@ -568,7 +788,9 @@ pub async fn diagnose() -> Value {
             "HTTPS_PROXY": std::env::var("HTTPS_PROXY").ok().map(|p| redact_proxy(&p)),
             "ALL_PROXY": std::env::var("ALL_PROXY").ok().map(|p| redact_proxy(&p)),
             "NO_PROXY": std::env::var("NO_PROXY").ok().map(|_| "[已配置，列表已隐藏]"),
-            "HGHUBX_PROXY": proxy_override().map(|p| redact_proxy(&p)),
+            "HGHUB_PROXY": proxy_override().map(|p| redact_proxy(&p)),
+            "GNOME_PROXY": gnome_proxy().map(|p| redact_proxy(&p)),
+            "system_proxy": system_proxy_enabled(),
         },
         "runtime": {
             "os": std::env::consts::OS,
@@ -665,7 +887,7 @@ fn edge_redirect_target(
     network_policy::redirect_target(current, location)
 }
 
-/// 业务请求：兼容旧调用方，内部拼标准信封。
+/// 业务请求：走边缘信封。
 pub async fn edge(
     origin: &str,
     method: &str,
@@ -673,7 +895,17 @@ pub async fn edge(
     body: Option<Value>,
     token: Option<&str>,
 ) -> Result<Value, String> {
-    let body_is_none = body.is_none();
+    let cur = normalize_base(origin).ok_or("业务请求必须使用安全 HTTPS 线路")?;
+    if network_policy::strict_security()
+        && (token.is_some()
+            || matches!(
+                path,
+                "/api/account/loginByPassword" | "/api/account/registerByPassword"
+            ))
+        && !trusted_auth_origin(&cur)
+    {
+        return Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路".into());
+    }
     let (encoded, ctype) = match &body {
         Some(v) => (
             B64.encode(serde_json::to_vec(v).map_err(|e| e.to_string())?),
@@ -687,32 +919,6 @@ pub async fn edge(
         "body": encoded,
         "content_type": ctype,
     });
-    edge_envelope(origin, envelope, method, path, body_is_none, token).await
-}
-
-/// 适配器已拼好信封、只需传输的入口；`body_is_none` 决定是否允许安全重试。
-pub async fn edge_envelope(
-    origin: &str,
-    envelope: Value,
-    method: &str,
-    path: &str,
-    body_is_none: bool,
-    token: Option<&str>,
-) -> Result<Value, String> {
-    let cur = origin.trim().trim_end_matches('/').to_string();
-    if cur.is_empty() {
-        return Err("尚未设置接入地址".into());
-    }
-    if network_policy::strict_security()
-        && (token.is_some()
-            || matches!(
-                path,
-                "/api/account/loginByPassword" | "/api/account/registerByPassword"
-            ))
-        && !crate::infra::source::is_current_origin(&cur)
-    {
-        return Err("凭据只能发送到当前接入地址".into());
-    }
 
     let url = format!("{cur}/api/edge/request");
     let referer = format!("{cur}/");
@@ -721,13 +927,14 @@ pub async fn edge_envelope(
     static NEXT_EDGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request = NEXT_EDGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let line_host = url::Url::parse(&cur)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_owned))
-        .unwrap_or_default();
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_string();
     let operation = edge_operation(path);
     let mut attempt = 0;
-    let guest_get = method.eq_ignore_ascii_case("GET") && body_is_none && token.is_none();
-    let can_retry = method.eq_ignore_ascii_case("GET") && body_is_none;
+    let guest_get = method.eq_ignore_ascii_case("GET") && body.is_none() && token.is_none();
+    let can_retry = method.eq_ignore_ascii_case("GET") && body.is_none();
     let value = with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
@@ -896,9 +1103,9 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "联网测试：需要 HGHUBX_TEST_MEDIA_URL 为当前有效的媒体地址"]
+    #[ignore = "联网测试：需要 HGHUB_TEST_MEDIA_URL 为当前有效的媒体地址"]
     async fn media_recovers_from_failed_system_dns() {
-        let raw = std::env::var("HGHUBX_TEST_MEDIA_URL").expect("HGHUBX_TEST_MEDIA_URL");
+        let raw = std::env::var("HGHUB_TEST_MEDIA_URL").expect("HGHUB_TEST_MEDIA_URL");
         let target = url::Url::parse(&raw).unwrap();
         let host = target.host_str().unwrap();
         let port = target.port_or_known_default().unwrap();
@@ -922,7 +1129,7 @@ mod tests {
         } else {
             assert_eq!(bytes, again);
         }
-        if let Ok(path) = std::env::var("HGHUBX_TEST_MEDIA_OUTPUT") {
+        if let Ok(path) = std::env::var("HGHUB_TEST_MEDIA_OUTPUT") {
             std::fs::write(path, bytes).unwrap();
         }
     }
@@ -1035,17 +1242,17 @@ mod tests {
 
     #[test]
     fn edge_redirects_only_replay_anonymous_reads() {
-        let current = url::Url::parse("https://example.com/api/edge/request").unwrap();
+        let current = url::Url::parse("https://huangguoai.ai/api/edge/request").unwrap();
         assert_eq!(
             edge_redirect_target(
                 &current,
                 301,
-                "https://cdn.example.net/api/edge/request",
+                "https://huangguoai.com/api/edge/request",
                 true
             )
             .unwrap()
             .host_str(),
-            Some("cdn.example.net")
+            Some("huangguoai.com")
         );
         assert!(edge_redirect_target(&current, 302, "/next", true).is_ok());
         for status in [301, 302, 303, 307, 308] {
@@ -1074,16 +1281,47 @@ mod tests {
     }
 
     #[test]
-    fn default_base_is_empty_until_the_door_is_activated() {
-        assert!(DEFAULT_BASE.is_empty());
+    fn base_requires_https_origin_and_auth_trust_is_static() {
+        assert_eq!(
+            normalize_base("https://HUANGGUOAI.COM:443/"),
+            Some(DEFAULT_BASE.into())
+        );
+        for raw in [
+            "http://huangguoai.com",
+            "https://user:pass@huangguoai.com",
+            "https://huangguoai.com/path",
+            "https://huangguoai.com/?secret=1",
+            "https://huangguoai.com/#fragment",
+            "https://192.168.1.1",
+        ] {
+            assert_eq!(normalize_base(raw), None, "{raw}");
+        }
+        assert!(trusted_auth_origin(DEFAULT_BASE));
+        assert!(trusted_auth_origin("https://huangguoai.ai"));
+        assert!(!trusted_auth_origin("https://mirror.example"));
+        assert!(!trusted_auth_origin("https://huangguoai.com.evil.example"));
     }
 
     #[tokio::test]
-    async fn edge_requires_a_configured_source() {
-        let err = edge("", "GET", "/api/videos", None, None)
-            .await
-            .unwrap_err();
-        assert!(err.contains("尚未设置接入地址"));
+    async fn untrusted_origins_reject_credentials_before_network() {
+        for (path, body, token) in [
+            (
+                "/api/account/loginByPassword",
+                Some(json!({"password":"secret"})),
+                None,
+            ),
+            (
+                "/api/account/registerByPassword",
+                Some(json!({"password":"secret"})),
+                None,
+            ),
+            ("/api/videos", None, Some("secret-token")),
+        ] {
+            let err = edge("https://mirror.invalid", "POST", path, body, token)
+                .await
+                .unwrap_err();
+            assert!(err.contains("镜像线路仅供游客浏览"));
+        }
     }
 
     #[tokio::test]
